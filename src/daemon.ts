@@ -39,7 +39,7 @@ const tuiConnectionState = new TuiConnectionState({
     emitToClaude(
       systemMessage(
         "system_tui_disconnected",
-        `⚠️ Codex 终端界面已断开 (conn #${connId})。Codex 后台仍在运行，重新连接 TUI 即可恢复。`,
+        `⚠️ Codex TUI disconnected (conn #${connId}). Codex is still running in the background — reconnect the TUI to resume.`,
       ),
     );
   },
@@ -47,10 +47,10 @@ const tuiConnectionState = new TuiConnectionState({
     emitToClaude(
       systemMessage(
         "system_tui_reconnected",
-        `✅ Codex TUI 已重新连接 (conn #${connId})。桥接已恢复，可以继续通信。`,
+        `✅ Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`,
       ),
     );
-    codex.injectMessage("✅ Claude Code 仍在线，桥接已恢复。可以继续双向通信。");
+    codex.injectMessage("✅ Claude Code is still online, bridge restored. Bidirectional communication can continue.");
   },
 });
 
@@ -72,7 +72,7 @@ codex.on("ready", (threadId: string) => {
   emitToClaude(
     systemMessage(
       "system_ready",
-      `✅ Codex TUI 已连接，会话线程已创建 (${threadId})。桥接现已完全建立，可以使用 reply 工具向 Codex 发送消息。`,
+      `✅ Codex TUI connected, session thread created (${threadId}). Bridge is fully operational — use the reply tool to send messages to Codex.`,
     ),
   );
 
@@ -103,7 +103,7 @@ codex.on("exit", (code: number | null) => {
   emitToClaude(
     systemMessage(
       "system_codex_exit",
-      `⚠️ Codex app-server 已退出 (code ${code ?? "unknown"})。AgentBridge daemon 仍在运行，但需要重启 Codex 侧连接。`,
+      `⚠️ Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`,
     ),
   );
   broadcastStatus();
@@ -218,7 +218,7 @@ function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
       ws,
       systemMessage(
         "system_attach_prompt",
-        "📋 请在另一个终端运行以下命令连接 Codex TUI。下一条消息会单独发送完整命令。",
+        "📋 Run the following command in another terminal to connect the Codex TUI. The full command will be sent in the next message.",
       ),
     );
     sendBridgeMessage(ws, systemMessage("system_attach_cmd", attachCmd));
@@ -237,7 +237,7 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
   log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
 
   if (tuiConnectionState.canReply()) {
-    codex.injectMessage("⚠️ Claude Code 已下线。AgentBridge 仍在后台运行；重新打开 Claude 后会自动重连。");
+    codex.injectMessage("⚠️ Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.");
   }
 }
 
@@ -295,15 +295,15 @@ function currentStatus(): DaemonStatus {
 }
 
 function currentWaitingMessage() {
-  return "⏳ AgentBridge 已启动，等待 Codex TUI 连接中。请勿发送消息，收到\"✅\"后再开始通信。";
+  return "⏳ AgentBridge started, waiting for Codex TUI to connect. Do not send messages until you see the \"✅\" confirmation.";
 }
 
 function currentReadyMessage() {
-  return `✅ Codex TUI 已连接，会话线程已创建 (${codex.activeThreadId}). 桥接现已完全建立，可以使用 reply 工具向 Codex 发送消息。`;
+  return `✅ Codex TUI connected, session thread created (${codex.activeThreadId}). Bridge is fully operational — use the reply tool to send messages to Codex.`;
 }
 
 function notifyCodexClaudeOnline() {
-  codex.injectMessage("✅ AgentBridge 已与 Claude Code 建立连接。你现在可以与 Claude 双向通信了。");
+  codex.injectMessage("✅ AgentBridge connected to Claude Code. You can now communicate with Claude bidirectionally.");
 }
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
@@ -339,7 +339,7 @@ async function bootCodex() {
     emitToClaude(
       systemMessage(
         "system_attach_prompt",
-        "📋 请在另一个终端运行以下命令连接 Codex TUI。下一条消息会单独发送完整命令。",
+        "📋 Run the following command in another terminal to connect the Codex TUI. The full command will be sent in the next message.",
       ),
     );
     emitToClaude(systemMessage("system_attach_cmd", attachCmd));
@@ -349,7 +349,7 @@ async function bootCodex() {
     emitToClaude(
       systemMessage(
         "system_codex_start_failed",
-        `❌ AgentBridge 无法启动 Codex app-server: ${err.message}`,
+        `❌ AgentBridge failed to start Codex app-server: ${err.message}`,
       ),
     );
     broadcastStatus();

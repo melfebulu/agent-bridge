@@ -44,7 +44,7 @@ daemonClient.on("disconnect", () => {
   log("Daemon control connection closed");
   void claude.pushNotification(systemMessage(
     "system_daemon_disconnected",
-    "⚠️ AgentBridge daemon 控制连接已断开。Codex 代理可能仍在后台运行，但 Claude 当前无法继续双向通信。",
+    "⚠️ AgentBridge daemon control connection lost. The Codex proxy may still be running in the background, but Claude cannot communicate bidirectionally right now.",
   ));
 });
 
@@ -60,7 +60,7 @@ claude.on("ready", async () => {
     await claude.pushNotification(
       systemMessage(
         "system_daemon_connect_failed",
-        `❌ AgentBridge daemon 启动失败或不可达: ${err.message}`,
+        `❌ AgentBridge daemon failed to start or is unreachable: ${err.message}`,
       ),
     );
   }
