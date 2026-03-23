@@ -282,7 +282,112 @@ This preserves flexibility without requiring the user to constantly switch expli
 - Implementation and debugging flows feel more intentional and less ad hoc.
 - The bridge feels more structured without becoming a workflow engine.
 
-## 6. Out of Scope for v1
+## 6. Distribution and Quick Start
+
+Making AgentBridge easy to try should not wait for the larger v2 architecture. The right v1 direction is to package the current single-bridge experience as a local CLI product rather than leaving it as a repository-first developer setup.
+
+### Recommended product shape
+
+The preferred distribution model for v1 is:
+
+- an `npm` package for distribution
+- an `agentbridge` CLI as the primary product interface
+
+This keeps installation, diagnostics, configuration, and lifecycle management in one place. It also fits the current system better than trying to start with an extension-first design.
+
+Recommended core commands:
+
+- `agentbridge init`
+- `agentbridge doctor`
+- `agentbridge start`
+- `agentbridge stop`
+- `agentbridge status`
+- `agentbridge attach`
+
+### Quick-start model
+
+In this model, `npx` should be treated as an installer or bootstrap entrypoint, not the long-term runtime entrypoint.
+
+The expected first-run flow is:
+
+1. Run `npx agentbridge init`
+2. Let the CLI check local prerequisites and environment health
+3. Let the CLI write or update MCP configuration
+4. Let the CLI generate project-level context files or prompt skeletons
+5. Start Claude Code with the configured AgentBridge integration
+
+The `init` command should do the most work because it is the highest-friction step in adoption. It should:
+
+- verify required tools and versions
+- detect Codex availability
+- validate local ports and startup assumptions
+- write or patch MCP configuration
+- generate project file skeletons for shared context and agent overlays
+
+### Why v1 should not start with an extension or plugin
+
+An extension or plugin may still be useful later, but it should not be the first product shape.
+
+- The hardest current problems are local bootstrap, process lifecycle, health checks, and configuration.
+- Those are CLI problems first, not UI shell problems.
+- A plugin can later wrap or invoke the CLI, but it should not replace the CLI as the base layer.
+
+### Technical challenges
+
+The main delivery challenges for this direction are:
+
+- reducing or packaging the current Bun runtime dependency for easier installation
+- safely writing or merging MCP configuration
+- discovering and validating the local Codex installation
+- handling platform differences across local environments
+
+These are practical productization challenges, but they are still much smaller than introducing a full plugin platform or a v2-style architecture migration.
+
+## 7. Collaboration Awareness Injection
+
+### Problem
+
+By default, each agent behaves as if it is working alone. Even if AgentBridge is connected, the participant may not clearly know that another agent is actively collaborating in the same workflow, or how that collaboration is supposed to work.
+
+### Proposed improvement
+
+Use the bridge to inject collaboration awareness automatically.
+
+After the bridge connects, each agent should be told two things:
+
+1. you are not working alone
+2. this is how collaboration should work
+
+This keeps the model simple. The user should not need to manually create project context files, prompt overlays, or coordination documents just to get the basic collaborative behavior.
+
+In v1, the bridge should package the existing collaboration guidance from v1.1, v1.2, and v1.3 into a single collaboration-awareness injection:
+
+- message quality and marker expectations from v1.1
+- turn and attention expectations from v1.2
+- role contract and thinking-pattern expectations from v1.3
+
+### Delivery path
+
+The injection path should stay lightweight and runtime-specific:
+
+- Claude receives collaboration awareness through channel instructions
+- Codex receives collaboration awareness through bridge contract reminders
+
+This keeps the implementation aligned with the current architecture rather than introducing a larger prompt-management system.
+
+### User experience goal
+
+The target experience is zero configuration for basic collaboration awareness.
+
+Users should not need to:
+
+- create extra project prompt files
+- manually synchronize instructions across agents
+- manage a separate prompt system just to tell the agents they are collaborating
+
+The bridge itself should establish that shared awareness automatically when the session starts.
+
+## 8. Out of Scope for v1
 
 The following items are intentionally left out of v1 because they either require architectural restructuring or would pull later-version complexity into the current codebase:
 
@@ -295,7 +400,7 @@ The following items are intentionally left out of v1 because they either require
 
 These items belong to v2 or later because they cross the boundary from user experience optimization into architectural redesign.
 
-## 7. Version Positioning: v1 -> v2 -> v3 -> v4
+## 9. Version Positioning: v1 -> v2 -> v3 -> v4
 
 - **v1** focuses on improving the single-bridge user experience: better message quality, clearer turn discipline, and more intentional role-aware collaboration.
 - **v2** introduces the architectural foundation for multi-agent, multi-room, and recoverable collaboration.

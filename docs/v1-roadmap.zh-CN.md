@@ -342,7 +342,84 @@ v1.3 覆盖两个正交维度：
 - 方案质量更高，因为经过了交叉验证
 - 调试效率更高，因为有结构化的假设-实验循环
 
-## 6. v1 范围外的项目
+## 6. 产品分发与快速启动
+
+### 目标
+
+让用户从"clone 仓库、装依赖、改配置"变成一行命令就能用。
+
+### 方案：CLI-First
+
+以 npm package 作为分发渠道，`agentbridge` CLI 作为产品界面。不先做 Claude Code extension 或 plugin——CLI 更通用，能覆盖整个本地链路的 bootstrap。
+
+**核心命令：**
+
+| 命令 | 用途 |
+|------|------|
+| `agentbridge init` | 检查环境（Node/Bun、Claude Code、Codex）、写入 MCP 配置、生成项目文件骨架 |
+| `agentbridge doctor` | 诊断环境问题（依赖缺失、端口冲突、配置错误） |
+| `agentbridge start` | 启动 daemon（或复用已有） |
+| `agentbridge stop` | 停止 daemon |
+| `agentbridge status` | 查看 daemon、agent、连接状态 |
+| `agentbridge attach` | 连接 Codex TUI |
+
+**安装体验：**
+
+```bash
+# 首次安装和配置
+npx agentbridge init
+
+# 之后正常使用 Claude Code，bridge 自动启动
+claude --dangerously-load-development-channels server:agentbridge
+```
+
+> `npx` 作为安装器，不作为长期运行时入口。`init` 完成后 MCP 配置指向本地稳定的可执行入口，避免每次启动都临时解析远程包。
+
+**技术难点：**
+
+- **Bun 依赖**：当前代码依赖 Bun 运行时，npm 生态默认 Node。需要去 Bun 化或打包成独立可执行文件
+- **MCP 配置写入**：需要安全地合并到用户已有的 `~/.claude/.mcp.json`，处理已有配置和错误恢复
+- **Codex 发现**：CLI 需要检测 `codex` 命令是否存在、版本是否兼容
+- **Daemon 生命周期**：启动、复用、僵尸 PID、端口冲突的产品化处理
+- **跨平台**：macOS / Linux 优先，Windows 需要额外适配
+
+**不先做的形态：**
+
+- Claude Code extension / packaged channel — 等 CLI 稳定后再做薄封装
+- 桌面 App — v3/v4 的事
+
+## 7. 协作意识注入
+
+### 问题
+
+每个 agent 默认都认为自己是唯一在工作的。它不知道有其他 agent 在协作，也不知道该怎么和别人配合。
+
+### 方案
+
+Bridge 连接后，自动向每个 agent 注入两件事：
+
+1. **你不是一个人** — 告诉它现在有其他 agent 在跟它协作，是谁、是什么类型
+2. **怎么协作** — 告诉它协作规则：消息标记（v1.1）、轮次协调（v1.2）、角色分工和思考模式（v1.3）
+
+用户不需要手动写任何额外文件。这些由 bridge 在以下时机自动完成：
+
+- **Claude 侧**：通过 channel instructions 注入（`claude-adapter.ts`），Claude 启动时就知道协作规则
+- **Codex 侧**：通过 bridge contract reminder 注入（每次转发消息时附带），持续强化协作意识
+
+### 注入内容
+
+| 注入给 | 内容 |
+|--------|------|
+| Claude | "你正在通过 AgentBridge 与 Codex 协作。Codex 是一个执行型 agent，擅长代码编写和命令执行。消息使用 [IMPORTANT]/[STATUS]/[FYI] 标记。Codex 忙时不要发消息。遇到设计决策先独立分析再和 Codex 对比结论。" |
+| Codex | "你正在通过 AgentBridge 与 Claude 协作。Claude 是一个分析型 agent，擅长审查和规划。只在关键节点发送 agentMessage，使用 [IMPORTANT]/[STATUS]/[FYI] 标记。有分歧时用证据辩论，不要盲从。" |
+
+### 关键原则
+
+- **自动注入，零用户配置** — 用户不需要写提示词文件，bridge 负责一切
+- **v1.1/v1.2/v1.3 的内容统一在这里注入** — 消息标记、轮次协调、角色分工不是分散的，而是作为一个完整的协作意识包注入
+- **未来多 agent 时自动扩展** — 新 agent 加入后，bridge 自动告诉所有参与者"现在多了一个队友"
+
+## 8. v1 范围外的项目
 
 以下项目明确不在 v1 范围内，留给 v2 或更后续版本：
 
@@ -358,7 +435,7 @@ v1.3 覆盖两个正交维度：
 | Runtime 级事件流拦截 | 需要深入 Codex app-server 协议，属于 v2 richer observability | v2+ |
 | 完整的显式寻址路由 | 需要 Room + 多 agent，v1 单对端无实际路由价值 | v2 |
 
-## 7. 版本演进定位
+## 9. 版本演进定位
 
 | 版本 | 一句话定位 |
 |------|-----------|
