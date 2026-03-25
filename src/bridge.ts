@@ -6,6 +6,7 @@ import { DaemonClient } from "./daemon-client";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
+import { buildContextMessage, initWorkspace, loadSessionConfig, updateSyncMode } from "./session-config";
 import type { BridgeMessage } from "./types";
 
 const stateDir = new StateDirResolver();
@@ -43,6 +44,14 @@ claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
   }
 
   return daemonClient.sendReply(msg, requireReply);
+});
+
+claude.setContextReloader(injectSessionContext);
+claude.setWorkspaceIniter(async () => initWorkspace());
+claude.setSyncModeSwitcher(async (mode) => {
+  const configPath = updateSyncMode(mode);
+  await injectSessionContext();
+  return configPath;
 });
 
 daemonClient.on("codexMessage", (message) => {
@@ -96,6 +105,7 @@ async function connectToDaemon(isReconnect = false) {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
     daemonClient.attachClaude();
+    await injectSessionContext();
     if (!isReconnect) {
       void claude.pushNotification(systemMessage(
         "system_bridge_ready",
@@ -135,6 +145,45 @@ async function notifyIfDaemonKilled(logMessage: string) {
     "⛔ AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.",
   );
   return true;
+}
+
+async function injectSessionContext() {
+  const result = loadSessionConfig();
+  if (!result) return;
+
+  const { config, configDir } = result;
+  log(`Loaded session config from ${configDir}/.agentbridge.json`);
+
+  if (config.deliveryMode && !process.env.AGENTBRIDGE_MODE) {
+    log(`Note: deliveryMode="${config.deliveryMode}" in config (env var AGENTBRIDGE_MODE takes precedence)`);
+  }
+
+  const context = await buildContextMessage(config, configDir);
+  if (!context) return;
+
+  log(`Injecting session context (${context.length} chars) from .agentbridge.json`);
+  await claude.pushNotification(
+    systemMessage(
+      "system_session_context",
+      `📋 **Session context loaded from .agentbridge.json**\n\n${context}`,
+    ),
+  );
+
+  // In master mode, Claude shares knowledge with Codex (Slave).
+  if (config.syncMode === "master") {
+    log("Master mode: relaying session context to Codex...");
+    const relayResult = await daemonClient.sendReply({
+      id: `system_context_relay_${Date.now()}`,
+      source: "claude",
+      content: `📋 **Session context shared by Claude (Master) from .agentbridge.json**\n\n${context}`,
+      timestamp: Date.now(),
+    });
+    if (relayResult.success) {
+      log("Master mode: session context relayed to Codex");
+    } else {
+      log(`Master mode: relay to Codex failed — ${relayResult.error ?? "unknown error"}`);
+    }
+  }
 }
 
 function reconnectToDaemon(): Promise<void> {

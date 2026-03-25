@@ -24,6 +24,9 @@ import { appendFileSync } from "node:fs";
 import type { BridgeMessage } from "./types";
 
 export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
+export type ContextReloader = () => Promise<void>;
+export type WorkspaceIniter = () => Promise<string>;
+export type SyncModeSwitcher = (mode: "master" | "peer") => Promise<string>;
 export type DeliveryMode = "push" | "pull" | "auto";
 
 export const CLAUDE_INSTRUCTIONS = [
@@ -68,6 +71,9 @@ export class ClaudeAdapter extends EventEmitter {
   private sessionId: string;
   private readonly notificationIdPrefix: string;
   private replySender: ReplySender | null = null;
+  private contextReloader: ContextReloader | null = null;
+  private workspaceIniter: WorkspaceIniter | null = null;
+  private syncModeSwitcher: SyncModeSwitcher | null = null;
 
   // Dual-mode transport
   private readonly configuredMode: DeliveryMode;
@@ -112,6 +118,21 @@ export class ClaudeAdapter extends EventEmitter {
   /** Register the async sender that bridge provides for reply delivery. */
   setReplySender(sender: ReplySender) {
     this.replySender = sender;
+  }
+
+  /** Register the async function that reloads .agentbridge.json and injects context. */
+  setContextReloader(reloader: ContextReloader) {
+    this.contextReloader = reloader;
+  }
+
+  /** Register the async function that creates a .agentbridge.json template. */
+  setWorkspaceIniter(initer: WorkspaceIniter) {
+    this.workspaceIniter = initer;
+  }
+
+  /** Register the async function that switches syncMode and reloads context. */
+  setSyncModeSwitcher(switcher: SyncModeSwitcher) {
+    this.syncModeSwitcher = switcher;
   }
 
   /** Returns the resolved delivery mode. */
@@ -267,6 +288,42 @@ export class ClaudeAdapter extends EventEmitter {
             required: [],
           },
         },
+        {
+          name: "reload_session_context",
+          description:
+            "Reload .agentbridge.json from the working directory and re-inject session context (knowledge files, roles, preamble). Use this after editing the config file without restarting Claude.",
+          inputSchema: {
+            type: "object" as const,
+            properties: {},
+            required: [],
+          },
+        },
+        {
+          name: "init_workspace",
+          description:
+            "Generate a .agentbridge.json template in the current workspace directory. Use this to set up a new collaboration workspace. After running, edit the generated file and call reload_session_context to apply it.",
+          inputSchema: {
+            type: "object" as const,
+            properties: {},
+            required: [],
+          },
+        },
+        {
+          name: "set_sync_mode",
+          description:
+            'Switch the knowledge sync mode. "master" = Claude fetches knowledge and shares with Codex. "peer" = both agents independently fetch their own knowledge. Updates .agentbridge.json and reloads session context.',
+          inputSchema: {
+            type: "object" as const,
+            properties: {
+              mode: {
+                type: "string",
+                enum: ["master", "peer"],
+                description: 'The sync mode to set: "master" or "peer".',
+              },
+            },
+            required: ["mode"],
+          },
+        },
       ],
     }));
 
@@ -281,11 +338,106 @@ export class ClaudeAdapter extends EventEmitter {
         return this.drainMessages();
       }
 
+      if (name === "reload_session_context") {
+        return this.handleReloadSessionContext();
+      }
+
+      if (name === "init_workspace") {
+        return this.handleInitWorkspace();
+      }
+
+      if (name === "set_sync_mode") {
+        return this.handleSetSyncMode(args as Record<string, unknown>);
+      }
+
       return {
         content: [{ type: "text" as const, text: `Unknown tool: ${name}` }],
         isError: true,
       };
     });
+  }
+
+  private async handleReloadSessionContext() {
+    if (!this.contextReloader) {
+      return {
+        content: [{ type: "text" as const, text: "Error: context reloader not registered." }],
+        isError: true,
+      };
+    }
+    try {
+      await this.contextReloader();
+      return {
+        content: [{ type: "text" as const, text: "Session context reloaded from .agentbridge.json." }],
+      };
+    } catch (err: any) {
+      return {
+        content: [{ type: "text" as const, text: `Error reloading session context: ${err.message}` }],
+        isError: true,
+      };
+    }
+  }
+
+  private async handleInitWorkspace() {
+    if (!this.workspaceIniter) {
+      return {
+        content: [{ type: "text" as const, text: "Error: workspace initer not registered." }],
+        isError: true,
+      };
+    }
+    try {
+      const configPath = await this.workspaceIniter();
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              `✅ Created ${configPath}`,
+              "",
+              "Next steps:",
+              "1. Edit the file to configure your workspace (knowledge paths, roles, preamble).",
+              "2. Call reload_session_context to apply the changes without restarting.",
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (err: any) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${err.message}` }],
+        isError: true,
+      };
+    }
+  }
+
+  private async handleSetSyncMode(args: Record<string, unknown>) {
+    const mode = args?.mode as string | undefined;
+    if (mode !== "master" && mode !== "peer") {
+      return {
+        content: [{ type: "text" as const, text: 'Error: mode must be "master" or "peer".' }],
+        isError: true,
+      };
+    }
+
+    if (!this.syncModeSwitcher) {
+      return {
+        content: [{ type: "text" as const, text: "Error: sync mode switcher not registered." }],
+        isError: true,
+      };
+    }
+
+    try {
+      const configPath = await this.syncModeSwitcher(mode);
+      return {
+        content: [{
+          type: "text" as const,
+          text: `✅ Sync mode switched to "${mode}".\n\nUpdated: ${configPath}\nSession context has been reloaded.`,
+        }],
+      };
+    } catch (err: any) {
+      return {
+        content: [{ type: "text" as const, text: `Error switching sync mode: ${err.message}` }],
+        isError: true,
+      };
+    }
   }
 
   private async handleReply(args: Record<string, unknown>) {
