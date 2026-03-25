@@ -12,6 +12,7 @@ import {
 import { TuiConnectionState } from "./tui-connection-state";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 import type { BridgeMessage } from "./types";
+import { buildContextMessage, loadSessionConfig } from "./session-config";
 
 interface ControlSocketData {
   clientId: number;
@@ -133,6 +134,18 @@ codex.on("ready", (threadId: string) => {
 
   if (attachedClaude) {
     notifyCodexClaudeOnline();
+  }
+
+  // In peer mode, Codex independently fetches knowledge on startup.
+  // In master mode, Claude fetches and relays — skip independent fetch here.
+  const sessionResult = loadSessionConfig();
+  const syncMode = sessionResult?.config.syncMode ?? "peer";
+  if (syncMode !== "master") {
+    injectSessionContextToCodex().catch((err) => {
+      log(`Failed to inject session context to Codex: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  } else {
+    log("Master mode: Codex will receive knowledge from Claude (skipping independent fetch)");
   }
 });
 
@@ -446,6 +459,18 @@ function currentReadyMessage() {
 
 function notifyCodexClaudeOnline() {
   codex.injectMessage("✅ AgentBridge connected to Claude Code.");
+}
+
+async function injectSessionContextToCodex() {
+  const result = loadSessionConfig();
+  if (!result) return;
+
+  const { config, configDir } = result;
+  const context = await buildContextMessage(config, configDir);
+  if (!context) return;
+
+  log(`Injecting session context into Codex (${context.length} chars)`);
+  codex.injectMessage(`📋 **Session context from .agentbridge.json**\n\n${context}`);
 }
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {

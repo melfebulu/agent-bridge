@@ -5,6 +5,7 @@ import { appendFileSync, readFileSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { ClaudeAdapter } from "./claude-adapter";
 import { DaemonClient } from "./daemon-client";
+import { buildContextMessage, initWorkspace, loadSessionConfig, updateSyncMode } from "./session-config";
 import type { BridgeMessage } from "./types";
 
 const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
@@ -27,6 +28,14 @@ claude.setReplySender(async (msg: BridgeMessage) => {
   return daemonClient.sendReply(msg);
 });
 
+claude.setContextReloader(injectSessionContext);
+claude.setWorkspaceIniter(async () => initWorkspace());
+claude.setSyncModeSwitcher(async (mode) => {
+  const configPath = updateSyncMode(mode);
+  await injectSessionContext();
+  return configPath;
+});
+
 daemonClient.on("codexMessage", (message) => {
   log(`Forwarding daemon → Claude (${message.content.length} chars)`);
   void claude.pushNotification(message);
@@ -44,17 +53,22 @@ daemonClient.on("disconnect", () => {
   log("Daemon control connection closed");
   void claude.pushNotification(systemMessage(
     "system_daemon_disconnected",
-    "⚠️ AgentBridge daemon control connection lost. The Codex proxy may still be running in the background, but Claude cannot communicate bidirectionally right now.",
+    "⚠️ AgentBridge daemon control connection lost. Attempting to reconnect...",
   ));
+  void reconnectToDaemon();
 });
 
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
+  await connectToDaemon();
+});
 
+async function connectToDaemon() {
   try {
     await ensureDaemonRunning();
     await daemonClient.connect();
     daemonClient.attachClaude();
+    await injectSessionContext();
   } catch (err: any) {
     log(`Failed to connect to daemon: ${err.message}`);
     await claude.pushNotification(
@@ -64,7 +78,70 @@ claude.on("ready", async () => {
       ),
     );
   }
-});
+}
+
+async function injectSessionContext() {
+  const result = loadSessionConfig();
+  if (!result) return;
+
+  const { config, configDir } = result;
+  log(`Loaded session config from ${configDir}/.agentbridge.json`);
+
+  if (config.deliveryMode && !process.env.AGENTBRIDGE_MODE) {
+    log(`Note: deliveryMode="${config.deliveryMode}" in config (env var AGENTBRIDGE_MODE takes precedence)`);
+  }
+
+  const context = await buildContextMessage(config, configDir);
+  if (!context) return;
+
+  log(`Injecting session context (${context.length} chars) from .agentbridge.json`);
+  await claude.pushNotification(
+    systemMessage(
+      "system_session_context",
+      `📋 **Session context loaded from .agentbridge.json**\n\n${context}`,
+    ),
+  );
+
+  // In master mode, Claude shares knowledge with Codex (Slave).
+  if (config.syncMode === "master") {
+    log("Master mode: relaying session context to Codex...");
+    const result = await daemonClient.sendReply({
+      id: `system_context_relay_${Date.now()}`,
+      source: "claude",
+      content: `📋 **Session context shared by Claude (Master) from .agentbridge.json**\n\n${context}`,
+      timestamp: Date.now(),
+    });
+    if (result.success) {
+      log("Master mode: session context relayed to Codex");
+    } else {
+      log(`Master mode: relay to Codex failed — ${result.error ?? "unknown error"}`);
+    }
+  }
+}
+
+async function reconnectToDaemon(attempt = 0) {
+  if (shuttingDown) return;
+
+  const delayMs = Math.min(1000 * 2 ** attempt, 30000);
+  if (attempt > 0) {
+    log(`Reconnect attempt ${attempt}, waiting ${delayMs}ms...`);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+
+  if (shuttingDown) return;
+
+  try {
+    await connectToDaemon();
+    log("Reconnected to AgentBridge daemon successfully");
+    void claude.pushNotification(systemMessage(
+      "system_daemon_reconnected",
+      "✅ AgentBridge daemon reconnected successfully.",
+    ));
+  } catch (err: any) {
+    log(`Reconnect attempt ${attempt} failed: ${err.message}`);
+    void reconnectToDaemon(attempt + 1);
+  }
+}
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
   return {
