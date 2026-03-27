@@ -41,12 +41,17 @@ export async function runCodex(args: string[]) {
     log: (msg) => console.error(`[agentbridge] ${msg}`),
   });
 
-  // Ensure daemon is running
-  console.error("[agentbridge] Ensuring daemon is running...");
+  // Ensure daemon is running — only log if daemon needs to be started
+  const daemonAlreadyRunning = await lifecycle.isHealthy();
+  if (!daemonAlreadyRunning) {
+    console.error("[agentbridge] Starting daemon...");
+  }
   try {
     lifecycle.clearKilled();
     await lifecycle.ensureRunning();
-    console.error("[agentbridge] Daemon is ready.");
+    if (!daemonAlreadyRunning) {
+      console.error("[agentbridge] Daemon ready.");
+    }
   } catch (err: any) {
     console.error(`[agentbridge] Failed to start daemon: ${err.message}`);
     console.error("[agentbridge] Try: agentbridge kill && agentbridge claude");

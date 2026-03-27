@@ -13,8 +13,48 @@ import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
 import { appendFileSync } from "node:fs";
+import { platform } from "node:os";
 import type { BridgeMessage, CodexItem } from "./types";
 import type { ServerWebSocket } from "bun";
+
+// ── Windows port helpers ──────────────────────────────────────────────────────
+
+/** Get PIDs listening on a given TCP port on Windows using netstat -ano. */
+function getPortPidsWindows(port: number): string[] {
+  try {
+    const out = execSync("netstat -ano", { encoding: "utf-8" });
+    const pids = new Set<string>();
+    for (const line of out.split("\n")) {
+      const trimmed = line.trim();
+      const parts = trimmed.split(/\s+/);
+      if (parts.length < 5) continue;
+      const localAddr = parts[1];
+      if (!localAddr.endsWith(`:${port}`)) continue;
+      const pid = parts[parts.length - 1];
+      if (pid && /^\d+$/.test(pid) && pid !== "0") pids.add(pid);
+    }
+    return [...pids];
+  } catch {
+    return [];
+  }
+}
+
+/** Get a process's command line on Windows via PowerShell WMI. */
+function getProcessCmdlineWindows(pid: string): string {
+  try {
+    return execSync(
+      `powershell.exe -Command "(Get-WmiObject Win32_Process -Filter 'ProcessId=${pid}').CommandLine"`,
+      { encoding: "utf-8" },
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
+/** Kill a process by PID on Windows. */
+function killProcessWindows(pid: string): void {
+  try { execSync(`taskkill /F /PID ${pid}`, { encoding: "utf-8" }); } catch {}
+}
 
 interface TuiSocketData {
   connId: number;
@@ -681,19 +721,27 @@ export class CodexAdapter extends EventEmitter {
    * occupied by something else, throws with a clear message.
    */
   private async checkPorts() {
+    const isWindows = platform() === "win32";
     for (const port of [this.appPort, this.proxyPort]) {
       try {
-        const pids = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
-        if (!pids) continue;
+        let pidList: string[];
+        if (isWindows) {
+          pidList = getPortPidsWindows(port);
+        } else {
+          const raw = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
+          pidList = raw ? raw.split("\n").map((p) => p.trim()).filter(Boolean) : [];
+        }
+        if (pidList.length === 0) continue;
 
         // Check if the occupying process is a codex app-server (our own stale spawn)
-        const pidList = pids.split("\n").map((p) => p.trim()).filter(Boolean);
         const staleCodexPids: string[] = [];
         const foreignPids: string[] = [];
 
         for (const pid of pidList) {
           try {
-            const cmdline = execSync(`ps -p ${pid} -o args=`, { encoding: "utf-8" }).trim();
+            const cmdline = isWindows
+              ? getProcessCmdlineWindows(pid)
+              : execSync(`ps -p ${pid} -o args=`, { encoding: "utf-8" }).trim();
             if (cmdline.includes("codex") && cmdline.includes("app-server")) {
               staleCodexPids.push(pid);
             } else {
@@ -708,7 +756,11 @@ export class CodexAdapter extends EventEmitter {
         if (staleCodexPids.length > 0) {
           this.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
           for (const pid of staleCodexPids) {
-            try { execSync(`kill ${pid}`, { encoding: "utf-8" }); } catch {}
+            if (isWindows) {
+              killProcessWindows(pid);
+            } else {
+              try { execSync(`kill ${pid}`, { encoding: "utf-8" }); } catch {}
+            }
           }
           await new Promise((r) => setTimeout(r, 500));
         }
@@ -722,21 +774,25 @@ export class CodexAdapter extends EventEmitter {
         }
 
         // Verify port is now free
-        try {
-          const remaining = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
-          if (remaining) {
-            throw new Error(
-              `Port ${port} is still occupied (PID(s): ${remaining.replace(/\n/g, ", ")}) after cleanup. ` +
-              `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`
-            );
-          }
-        } catch (err: any) {
-          if (err.message?.includes("Port")) throw err;
-          // lsof exit 1 = port free, good
+        const remaining = isWindows
+          ? getPortPidsWindows(port)
+          : (() => {
+              try {
+                const r = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
+                return r ? r.split("\n").filter(Boolean) : [];
+              } catch {
+                return []; // lsof exit 1 = port free
+              }
+            })();
+        if (remaining.length > 0) {
+          throw new Error(
+            `Port ${port} is still occupied (PID(s): ${remaining.join(", ")}) after cleanup. ` +
+            `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`
+          );
         }
       } catch (err: any) {
-        // lsof returns exit code 1 if no match — port is free
         if (err.message?.includes("Port") || err.message?.includes("non-Codex")) throw err;
+        // lsof returns exit code 1 if no match — port is free (Unix only path)
       }
     }
   }
