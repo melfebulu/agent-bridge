@@ -70,13 +70,63 @@ AgentBridge 采用两层进程结构：
 
 ## Quick Start
 
-> **注意：** AgentBridge 尚未发布到插件市场，当前使用仓库内的本地插件。
+### 通过插件市场安装（推荐）
+
+在 Claude Code 中直接安装 AgentBridge 插件：
 
 ```bash
-# 1. 安装依赖
-cd agent_bridge
+# 1. 在 Claude Code 中，添加 AgentBridge 市场
+/plugin marketplace add raysonmeng/agent-bridge
+
+# 2. 安装插件
+/plugin install agentbridge@agentbridge
+
+# 3. 重新加载插件以激活
+/reload-plugins
+```
+
+然后安装 CLI 工具：
+
+```bash
+# 4. 克隆仓库并安装 CLI
+git clone https://github.com/raysonmeng/agent-bridge.git
+cd agent-bridge
 bun install
 bun link    # 全局注册 agentbridge 命令
+
+# 5. 生成项目配置（可选）
+agentbridge init
+
+# 6. 启动 Claude Code（自动加载 AgentBridge channel）
+agentbridge claude
+
+# 7. 在另一个终端启动 Codex TUI 连接 Bridge
+agentbridge codex
+```
+
+就这样。Daemon 会在需要时自动启动，重启后自动重连。
+
+#### 更新插件
+
+新版本发布后，在 Claude Code 中更新：
+
+```bash
+/plugin marketplace update agentbridge
+/reload-plugins
+```
+
+或启用自动更新：执行 `/plugin` → **Marketplaces** 标签页 → 选择 **agentbridge** → **Enable auto-update**。
+
+### 本地开发安装
+
+如需修改 AgentBridge 源码，使用本地开发模式：
+
+```bash
+# 1. 克隆并安装依赖
+git clone https://github.com/raysonmeng/agent-bridge.git
+cd agent-bridge
+bun install
+bun link
 
 # 2. 安装本地插件 + 生成项目配置
 agentbridge dev     # 注册本地 marketplace + 安装插件
@@ -89,11 +139,9 @@ agentbridge claude
 agentbridge codex
 ```
 
-就这样。Daemon 会在需要时自动启动，重启后自动重连。
+> **注意：** `agentbridge claude` 会自动注入 `--dangerously-load-development-channels plugin:agentbridge@agentbridge`。这会把本地开发中的 channel 挂载进 Claude Code（当前属于 Research Preview）。请只启用你信任的 channel 和 MCP server。
 
-> **注意：** `agentbridge claude` 会自动注入 `--dangerously-load-development-channels server:agentbridge`。这会把本地开发中的 channel 挂载进 Claude Code（当前属于 Research Preview）。请只启用你信任的 channel 和 MCP server。
-
-### 修改代码后更新
+#### 修改代码后更新
 
 修改 AgentBridge 源码后，重新执行 `agentbridge dev` 同步插件到缓存，然后重启 Claude Code 或在活跃会话中执行 `/reload-plugins`。
 
@@ -102,9 +150,9 @@ agentbridge codex
 | 命令 | 说明 |
 |------|------|
 | `agentbridge init` | 安装插件、检查依赖（bun/claude/codex）、生成 `.agentbridge/config.json` 和 `collaboration.md` |
-| `agentbridge claude [args...]` | 启动 Claude Code 并启用 push channel。额外参数透传给 `claude` |
-| `agentbridge codex [args...]` | 启动连接到 AgentBridge daemon 的 Codex TUI。额外参数透传给 `codex` |
-| `agentbridge kill` | 优雅停止 daemon，清理状态文件，写入 killed sentinel 阻止自动重连 |
+| `agentbridge claude [args...]` | 启动 Claude Code 并启用 push channel。自动清除之前 `kill` 留下的 sentinel。额外参数透传给 `claude` |
+| `agentbridge codex [args...]` | 启动连接到 AgentBridge daemon 的 Codex TUI。管理 TUI 进程生命周期（pid 跟踪、清理）。额外参数透传给 `codex` |
+| `agentbridge kill` | 优雅停止 daemon 和托管的 Codex TUI，清理状态文件，写入 killed sentinel |
 | `agentbridge dev` | （开发用）注册本地 marketplace + 强制同步插件到缓存 |
 | `agentbridge --help` | 显示帮助 |
 | `agentbridge --version` | 显示版本 |

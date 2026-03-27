@@ -647,6 +647,13 @@ var BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] When sending agentMessage, put
 The marker MUST be the first text in the message (e.g. "[IMPORTANT] Task done", not "Task done [IMPORTANT]").
 Keep agentMessage for high-value communication only.
 
+[Git Operations \u2014 FORBIDDEN]
+You MUST NOT execute any git write commands. This includes but is not limited to:
+git commit, git push, git pull, git fetch, git checkout -b, git branch, git merge, git rebase, git cherry-pick, git tag, git stash.
+These commands write to the .git directory, which is blocked by your sandbox. Attempting them will cause your session to hang indefinitely.
+Read-only git commands (git status, git log, git diff, git show, git rev-parse) are allowed.
+All git write operations must be delegated to Claude Code via agentMessage. Report what you changed and let Claude handle branching, committing, and pushing.
+
 [Role Guidance for Codex]
 - Your default role: Implementer, Executor, Verifier
 - Analytical/review tasks: Independent Analysis & Convergence
@@ -809,7 +816,7 @@ class TuiConnectionState {
 }
 
 // src/daemon-lifecycle.ts
-import { spawn as spawn2, execSync as execSync2 } from "child_process";
+import { spawn as spawn2, execFileSync } from "child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
@@ -827,12 +834,15 @@ class DaemonLifecycle {
   get healthUrl() {
     return `http://127.0.0.1:${this.controlPort}/healthz`;
   }
+  get readyUrl() {
+    return `http://127.0.0.1:${this.controlPort}/readyz`;
+  }
   get controlWsUrl() {
     return `ws://127.0.0.1:${this.controlPort}/ws`;
   }
   async ensureRunning() {
-    this.clearKilled();
     if (await this.isHealthy()) {
+      await this.waitForReady();
       return;
     }
     const existingPid = this.readPid();
@@ -840,10 +850,10 @@ class DaemonLifecycle {
       if (isProcessAlive(existingPid)) {
         if (this.isDaemonProcess(existingPid)) {
           try {
-            await this.waitForHealthy(12, 250);
+            await this.waitForReady(12, 250);
             return;
           } catch {
-            throw new Error(`Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became healthy.`);
+            throw new Error(`Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became ready.`);
           }
         }
         this.log(`Pid ${existingPid} is alive but not an AgentBridge daemon, removing stale pid file`);
@@ -852,13 +862,13 @@ class DaemonLifecycle {
     }
     const lockAcquired = this.acquireLock();
     if (!lockAcquired) {
-      this.log("Another process is starting the daemon, waiting for health...");
-      await this.waitForHealthy();
+      this.log("Another process is starting the daemon, waiting for readiness...");
+      await this.waitForReady();
       return;
     }
     try {
       this.launch();
-      await this.waitForHealthy();
+      await this.waitForReady();
     } finally {
       this.releaseLock();
     }
@@ -878,6 +888,22 @@ class DaemonLifecycle {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     throw new Error(`Timed out waiting for AgentBridge daemon health on ${this.healthUrl}`);
+  }
+  async isReady() {
+    try {
+      const response = await fetch(this.readyUrl);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+  async waitForReady(maxRetries = 40, delayMs = 250) {
+    for (let attempt = 0;attempt < maxRetries; attempt++) {
+      if (await this.isReady())
+        return;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    throw new Error(`Timed out waiting for AgentBridge daemon readiness on ${this.readyUrl}`);
   }
   readStatus() {
     try {
@@ -950,7 +976,11 @@ class DaemonLifecycle {
     this.log("Removing stale pid file");
     this.removePidFile();
   }
-  acquireLock() {
+  acquireLock(depth = 0) {
+    if (depth > 1) {
+      this.log("Lock acquisition failed after retry, proceeding without lock");
+      return true;
+    }
     this.stateDir.ensure();
     try {
       const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
@@ -965,12 +995,12 @@ class DaemonLifecycle {
           if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
             this.log(`Stale lock file from dead process ${holderPid}, removing`);
             this.releaseLock();
-            return this.acquireLock();
+            return this.acquireLock(depth + 1);
           }
         } catch {
           this.log("Cannot read lock file, removing stale lock");
           this.releaseLock();
-          return this.acquireLock();
+          return this.acquireLock(depth + 1);
         }
         return false;
       }
@@ -1025,7 +1055,7 @@ class DaemonLifecycle {
   }
   isDaemonProcess(pid) {
     try {
-      const cmd = execSync2(`ps -p ${pid} -o command=`, { encoding: "utf-8" }).trim();
+      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
       return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
     } catch {
       return false;
@@ -1074,6 +1104,9 @@ class StateDirResolver {
   }
   get pidFile() {
     return join(this.stateDir, "daemon.pid");
+  }
+  get tuiPidFile() {
+    return join(this.stateDir, "codex-tui.pid");
   }
   get lockFile() {
     return join(this.stateDir, "daemon.lock");
@@ -1166,7 +1199,7 @@ class ConfigService {
     }
   }
   loadOrDefault() {
-    return this.load() ?? { ...DEFAULT_CONFIG };
+    return this.load() ?? structuredClone(DEFAULT_CONFIG);
   }
   save(config) {
     this.ensureConfigDir();
@@ -1219,6 +1252,7 @@ var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.daemon.
 var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.daemon.proxyPort), 10);
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
+var CLAUDE_DISCONNECT_GRACE_MS = 5000;
 var MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 var FILTER_MODE = process.env.AGENTBRIDGE_FILTER_MODE === "full" ? "full" : "filtered";
 var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
@@ -1237,6 +1271,11 @@ var replyRequired = false;
 var replyReceivedDuringTurn = false;
 var shuttingDown = false;
 var idleShutdownTimer = null;
+var claudeDisconnectTimer = null;
+var claudeOnlineNoticeSent = false;
+var claudeOfflineNoticeShown = false;
+var lastAttachStatusSentTs = 0;
+var ATTACH_STATUS_COOLDOWN_MS = 30000;
 var bufferedMessages = [];
 var tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
@@ -1307,7 +1346,7 @@ codex.on("ready", (threadId) => {
   log(`Codex ready \u2014 thread ${threadId}`);
   log("Bridge fully operational");
   emitToClaude(systemMessage("system_ready", currentReadyMessage()));
-  if (attachedClaude) {
+  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
 });
@@ -1328,8 +1367,12 @@ codex.on("error", (err) => {
 });
 codex.on("exit", (code) => {
   log(`Codex process exited (code ${code})`);
+  codexBootstrapped = false;
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
+  clearPendingClaudeDisconnect("Codex process exited");
+  claudeOnlineNoticeSent = false;
+  claudeOfflineNoticeShown = false;
   emitToClaude(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`));
   broadcastStatus();
 });
@@ -1339,8 +1382,11 @@ function startControlServer() {
     hostname: "127.0.0.1",
     fetch(req, server) {
       const url = new URL(req.url);
-      if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+      if (url.pathname === "/healthz") {
         return Response.json(currentStatus());
+      }
+      if (url.pathname === "/readyz") {
+        return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
       if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false } })) {
         return;
@@ -1348,12 +1394,14 @@ function startControlServer() {
       return new Response("AgentBridge daemon");
     },
     websocket: {
+      idleTimeout: 960,
+      sendPings: true,
       open: (ws) => {
         ws.data.clientId = ++nextControlClientId;
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
-      close: (ws) => {
-        log(`Frontend socket closed (#${ws.data.clientId})`);
+      close: (ws, code, reason) => {
+        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
         if (attachedClaude === ws) {
           detachClaude(ws, "frontend socket closed");
         }
@@ -1439,20 +1487,26 @@ function attachClaude(ws) {
   if (attachedClaude && attachedClaude !== ws) {
     attachedClaude.close(4001, "replaced by a newer Claude session");
   }
+  clearPendingClaudeDisconnect("Claude frontend attached");
   attachedClaude = ws;
   ws.data.attached = true;
   cancelIdleShutdown();
   log(`Claude frontend attached (#${ws.data.clientId})`);
   statusBuffer.flush("claude reconnected");
   sendStatus(ws);
+  const now = Date.now();
+  const isRapidReattach = now - lastAttachStatusSentTs < ATTACH_STATUS_COOLDOWN_MS;
   if (bufferedMessages.length > 0) {
     flushBufferedMessages(ws);
-  } else if (tuiConnectionState.canReply()) {
-    sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
-  } else if (codexBootstrapped) {
-    sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
+  } else if (!isRapidReattach) {
+    if (tuiConnectionState.canReply()) {
+      sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
+    } else if (codexBootstrapped) {
+      sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
+    }
   }
-  if (tuiConnectionState.canReply()) {
+  lastAttachStatusSentTs = now;
+  if (tuiConnectionState.canReply() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
 }
@@ -1462,9 +1516,7 @@ function detachClaude(ws, reason) {
   attachedClaude = null;
   ws.data.attached = false;
   log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
-  if (tuiConnectionState.canReply()) {
-    codex.injectMessage("\u26A0\uFE0F Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.");
-  }
+  scheduleClaudeDisconnectNotification(ws.data.clientId);
   scheduleIdleShutdown();
 }
 function startAttentionWindow() {
@@ -1510,6 +1562,37 @@ function cancelIdleShutdown() {
     clearTimeout(idleShutdownTimer);
     idleShutdownTimer = null;
   }
+}
+function clearPendingClaudeDisconnect(reason) {
+  if (!claudeDisconnectTimer)
+    return;
+  clearTimeout(claudeDisconnectTimer);
+  claudeDisconnectTimer = null;
+  if (reason) {
+    log(`Cleared pending Claude disconnect notification (${reason})`);
+  }
+}
+function scheduleClaudeDisconnectNotification(clientId) {
+  clearPendingClaudeDisconnect("rescheduled");
+  claudeDisconnectTimer = setTimeout(() => {
+    claudeDisconnectTimer = null;
+    if (attachedClaude) {
+      log(`Skipping Claude disconnect notification for client #${clientId} because Claude already reconnected`);
+      return;
+    }
+    if (!tuiConnectionState.canReply()) {
+      log(`Suppressing Claude disconnect notification for client #${clientId} because Codex cannot reply`);
+      return;
+    }
+    if (!claudeOnlineNoticeSent) {
+      log(`Suppressing Claude disconnect notification for client #${clientId} because Claude was never announced online`);
+      return;
+    }
+    codex.injectMessage("\u26A0\uFE0F Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.");
+    claudeOnlineNoticeSent = false;
+    claudeOfflineNoticeShown = true;
+    log(`Claude disconnect persisted past grace window (client #${clientId})`);
+  }, CLAUDE_DISCONNECT_GRACE_MS);
 }
 function emitToClaude(message) {
   if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
@@ -1587,7 +1670,12 @@ function currentReadyMessage() {
   return `\u2705 Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
 }
 function notifyCodexClaudeOnline() {
+  claudeOnlineNoticeSent = true;
+  claudeOfflineNoticeShown = false;
   codex.injectMessage("\u2705 AgentBridge connected to Claude Code.");
+}
+function shouldNotifyCodexClaudeOnline() {
+  return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
 }
 function systemMessage(idPrefix, content) {
   return {
@@ -1637,6 +1725,7 @@ function shutdown(reason) {
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
+  clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
   controlServer?.stop();
   controlServer = null;
   codex.stop();

@@ -31,6 +31,7 @@ const CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.daemo
 const CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.daemon.proxyPort), 10);
 const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 const TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
+const CLAUDE_DISCONNECT_GRACE_MS = 5_000;
 const MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 const FILTER_MODE: FilterMode =
   (process.env.AGENTBRIDGE_FILTER_MODE as FilterMode) === "full" ? "full" : "filtered";
@@ -53,6 +54,11 @@ let replyRequired = false;
 let replyReceivedDuringTurn = false;
 let shuttingDown = false;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
+let claudeDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let claudeOnlineNoticeSent = false;
+let claudeOfflineNoticeShown = false;
+let lastAttachStatusSentTs = 0;
+const ATTACH_STATUS_COOLDOWN_MS = 30_000; // Don't re-send status on rapid reattach
 
 const bufferedMessages: BridgeMessage[] = [];
 
@@ -169,7 +175,7 @@ codex.on("ready", (threadId: string) => {
     systemMessage("system_ready", currentReadyMessage()),
   );
 
-  if (attachedClaude) {
+  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
 });
@@ -194,8 +200,12 @@ codex.on("error", (err: Error) => {
 
 codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
+  codexBootstrapped = false;
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
+  clearPendingClaudeDisconnect("Codex process exited");
+  claudeOnlineNoticeSent = false;
+  claudeOfflineNoticeShown = false;
   emitToClaude(
     systemMessage(
       "system_codex_exit",
@@ -212,8 +222,12 @@ function startControlServer() {
     fetch(req, server) {
       const url = new URL(req.url);
 
-      if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+      if (url.pathname === "/healthz") {
         return Response.json(currentStatus());
+      }
+
+      if (url.pathname === "/readyz") {
+        return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
 
       if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false } })) {
@@ -223,12 +237,14 @@ function startControlServer() {
       return new Response("AgentBridge daemon");
     },
     websocket: {
+      idleTimeout: 960, // 16 minutes — prevent premature idle disconnects
+      sendPings: true,
       open: (ws: ServerWebSocket<ControlSocketData>) => {
         ws.data.clientId = ++nextControlClientId;
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
-      close: (ws: ServerWebSocket<ControlSocketData>) => {
-        log(`Frontend socket closed (#${ws.data.clientId})`);
+      close: (ws: ServerWebSocket<ControlSocketData>, code: number, reason: string) => {
+        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
         if (attachedClaude === ws) {
           detachClaude(ws, "frontend socket closed");
         }
@@ -320,6 +336,7 @@ function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
     attachedClaude.close(4001, "replaced by a newer Claude session");
   }
 
+  clearPendingClaudeDisconnect("Claude frontend attached");
   attachedClaude = ws;
   ws.data.attached = true;
   cancelIdleShutdown();
@@ -328,15 +345,23 @@ function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
   statusBuffer.flush("claude reconnected");
   sendStatus(ws);
 
+  const now = Date.now();
+  const isRapidReattach = now - lastAttachStatusSentTs < ATTACH_STATUS_COOLDOWN_MS;
+
   if (bufferedMessages.length > 0) {
     flushBufferedMessages(ws);
-  } else if (tuiConnectionState.canReply()) {
-    sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
-  } else if (codexBootstrapped) {
-    sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
+  } else if (!isRapidReattach) {
+    // Only send status messages if this is not a rapid reattach (avoid flooding Claude)
+    if (tuiConnectionState.canReply()) {
+      sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
+    } else if (codexBootstrapped) {
+      sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
+    }
   }
 
-  if (tuiConnectionState.canReply()) {
+  lastAttachStatusSentTs = now;
+
+  if (tuiConnectionState.canReply() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
 }
@@ -348,9 +373,7 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
   ws.data.attached = false;
   log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
 
-  if (tuiConnectionState.canReply()) {
-    codex.injectMessage("⚠️ Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.");
-  }
+  scheduleClaudeDisconnectNotification(ws.data.clientId);
 
   scheduleIdleShutdown();
 }
@@ -402,6 +425,50 @@ function cancelIdleShutdown() {
     clearTimeout(idleShutdownTimer);
     idleShutdownTimer = null;
   }
+}
+
+function clearPendingClaudeDisconnect(reason?: string) {
+  if (!claudeDisconnectTimer) return;
+  clearTimeout(claudeDisconnectTimer);
+  claudeDisconnectTimer = null;
+  if (reason) {
+    log(`Cleared pending Claude disconnect notification (${reason})`);
+  }
+}
+
+function scheduleClaudeDisconnectNotification(clientId: number) {
+  clearPendingClaudeDisconnect("rescheduled");
+  claudeDisconnectTimer = setTimeout(() => {
+    claudeDisconnectTimer = null;
+
+    if (attachedClaude) {
+      log(
+        `Skipping Claude disconnect notification for client #${clientId} because Claude already reconnected`,
+      );
+      return;
+    }
+
+    if (!tuiConnectionState.canReply()) {
+      log(
+        `Suppressing Claude disconnect notification for client #${clientId} because Codex cannot reply`,
+      );
+      return;
+    }
+
+    if (!claudeOnlineNoticeSent) {
+      log(
+        `Suppressing Claude disconnect notification for client #${clientId} because Claude was never announced online`,
+      );
+      return;
+    }
+
+    codex.injectMessage(
+      "⚠️ Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.",
+    );
+    claudeOnlineNoticeSent = false;
+    claudeOfflineNoticeShown = true;
+    log(`Claude disconnect persisted past grace window (client #${clientId})`);
+  }, CLAUDE_DISCONNECT_GRACE_MS);
 }
 
 function emitToClaude(message: BridgeMessage) {
@@ -490,7 +557,13 @@ function currentReadyMessage() {
 }
 
 function notifyCodexClaudeOnline() {
+  claudeOnlineNoticeSent = true;
+  claudeOfflineNoticeShown = false;
   codex.injectMessage("✅ AgentBridge connected to Claude Code.");
+}
+
+function shouldNotifyCodexClaudeOnline() {
+  return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
 }
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
@@ -553,6 +626,7 @@ function shutdown(reason: string) {
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
+  clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
   controlServer?.stop();
   controlServer = null;
   codex.stop();
